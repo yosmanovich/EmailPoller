@@ -1,0 +1,26 @@
+{
+  "deployment": {
+    "storage": {
+      "authentication": {
+        "storageAccountConnectionStringName": null,
+        "type": "SystemAssignedIdentity",
+        "userAssignedIdentityResourceId": null
+      },
+      "type": "blobContainer",
+      "value": "https://emailpoller9d14.blob.core.windows.net/app-package-emailpoller-2c7b367"
+    }
+  },
+  "runtime": {
+    "name": "dotnet-isolated",
+    "version": "8.0"
+  },
+  "scaleAndConcurrency": {
+    "alwaysReady": null,
+    "instanceMemoryMB": 2048,
+    "maximumInstanceCount": 100,
+    "triggers": null
+  },
+  "siteUpdateStrategy": {
+    "type": "Recreate"
+  }
+}

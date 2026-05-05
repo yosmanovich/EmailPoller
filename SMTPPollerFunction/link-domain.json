@@ -1,0 +1,7 @@
+{
+  "properties": {
+    "linkedDomains": [
+      "/subscriptions/944d8a66-cacd-43dd-8a16-1cc780ec564c/resourceGroups/EmailPoller/providers/Microsoft.Communication/emailServices/EmailPoller/domains/AzureManagedDomain"
+    ]
+  }
+}
