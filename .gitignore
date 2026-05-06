@@ -69,3 +69,6 @@ csx/
 
 # dotnet tool manifest
 .config/dotnet-tools.json
+
+.github
+.vscode
