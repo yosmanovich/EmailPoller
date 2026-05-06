@@ -1,8 +1,0 @@
-{
-    "azureFunctions.deploySubpath": "SMTPPollerFunction/bin/Release/net8.0/publish",
-    "azureFunctions.projectSubpath": "SMTPPollerFunction",
-    "azureFunctions.projectLanguage": "C#",
-    "azureFunctions.projectRuntime": "~4",
-    "debug.internalConsoleOptions": "neverOpen",
-    "azureFunctions.preDeployTask": "publish (functions)"
-}
