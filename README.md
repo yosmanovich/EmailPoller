@@ -67,6 +67,237 @@ Examples:
 - `0 */1 * * * *` - Every minute
 - `0 0 * * * *` - Every hour
 
+## SMTP Throttling & Rate Limiting
+
+The application includes built-in SMTP throttling protection to handle rate limits imposed by SMTP relays (e.g., Azure Communication Services limits to ~30 emails/minute).
+
+### How Throttling Works
+
+When an SMTP relay returns a rate-limiting error, the throttle service activates and implements an exponential backoff strategy:
+
+1. **Throttle Detection** - Recognizes common rate-limiting responses:
+   - SMTP error codes: `421`, `452`
+   - Enhanced status codes: `4.5.127`
+   - Message patterns: "rate limit", "throttl", "too many", "excessive"
+
+2. **Exponential Backoff** - When throttling is detected:
+   - Initial delay: **30 seconds**
+   - Each subsequent throttle doubles the delay
+   - Maximum delay cap: **15 minutes**
+
+3. **Recovery Behavior**:
+   - After **10 consecutive successful sends**, the backoff level decreases by one
+   - Inter-message delays are added during recovery to prevent re-triggering limits
+
+4. **Function Behavior During Throttling**:
+   - **SQL Trigger**: Skips processing and returns immediately (message remains in queue)
+   - **Timer Trigger**: Skips the entire batch run
+   - Both functions log when throttling causes them to skip processing
+
+### Throttle Levels & Timing
+
+| Level | Delay Before Next Send | After Recovery (10 successes) |
+|-------|------------------------|-------------------------------|
+| 0 | No delay (normal) | - |
+| 1 | 30 seconds | Returns to Level 0 |
+| 2 | 60 seconds | Returns to Level 1 |
+| 3 | 120 seconds (2 min) | Returns to Level 2 |
+| 4 | 240 seconds (4 min) | Returns to Level 3 |
+| 5 | 480 seconds (8 min) | Returns to Level 4 |
+| 6+ | 900 seconds (15 min max) | Returns to Level 5 |
+
+### Azure Communication Services (ACS) Considerations
+
+ACS SMTP relay has specific rate limiting behavior:
+- **Rate limit**: ~30 emails per minute
+- **Cooldown period**: Rate limits typically reset after **1 hour** of reduced activity
+- The throttle service works with this by reducing send frequency when limits are hit
+
+### Architecture
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  EmailQueue     │────▶│  Trigger         │────▶│  SmtpThrottle   │
+│  Trigger/Timer  │     │  Functions       │     │  Service        │
+└─────────────────┘     └────────┬─────────┘     └────────┬────────┘
+                                 │                        │
+                                 ▼                        ▼
+                        ┌──────────────────┐     ┌─────────────────┐
+                        │  EmailService    │────▶│  SMTP Relay     │
+                        │  (detects        │     │  (ACS, etc.)    │
+                        │   throttling)    │     └─────────────────┘
+                        └──────────────────┘
+```
+
+**Components:**
+- **SmtpThrottleService** - Singleton service tracking throttle state across function invocations
+- **SmtpThrottlingException** - Custom exception thrown when throttling is detected
+- **EmailService** - Detects throttling responses and throws `SmtpThrottlingException`
+- **Trigger Functions** - Check throttle state before processing, record outcomes
+
+### Monitoring Throttling
+
+Monitor throttling via Application Insights or log queries:
+
+```kusto
+// Find throttling events
+traces
+| where message contains "throttl" or message contains "rate limit"
+| order by timestamp desc
+| take 100
+
+// Check for skipped processing due to throttling
+traces
+| where message contains "currently throttled"
+| summarize count() by bin(timestamp, 1h)
+```
+
+## Azure Monitor Alerts
+
+This application integrates with **Application Insights** for telemetry and logging. You can configure Azure Monitor alert rules to receive notifications when issues occur—no code changes required.
+
+### Setting Up Alert Rules
+
+1. Navigate to your **Application Insights** resource in the Azure Portal
+2. Go to **Alerts** → **Create** → **Alert rule**
+3. Configure the alert condition (see examples below)
+4. Create or select an **Action Group** to define notification recipients
+
+### Recommended Alert Conditions
+
+#### 1. Email Send Failures
+
+Alert when emails fail to send:
+
+```kusto
+traces
+| where message contains "Failed to send email" or message contains "SmtpException"
+| where timestamp > ago(5m)
+```
+
+- **Condition:** Custom log search
+- **Threshold:** Greater than 0
+- **Frequency:** Every 5 minutes
+- **Severity:** Warning or Error
+
+#### 2. SMTP Throttling Detection
+
+Alert when SMTP rate limiting is triggered:
+
+```kusto
+traces
+| where message contains "SMTP throttling activated" or message contains "throttle level"
+| where timestamp > ago(15m)
+```
+
+- **Condition:** Custom log search
+- **Threshold:** Greater than 0
+- **Frequency:** Every 15 minutes
+- **Severity:** Warning
+
+#### 3. High Failure Rate
+
+Alert when failure rate exceeds a percentage threshold:
+
+```kusto
+traces
+| where timestamp > ago(30m)
+| extend isFailure = message contains "Failed" or message contains "Error"
+| summarize totalCount = count(), failureCount = countif(isFailure)
+| extend failureRate = (failureCount * 100.0) / totalCount
+| where failureRate > 10
+```
+
+- **Threshold:** Greater than 0 (query self-filters at 10% failure rate)
+- **Frequency:** Every 30 minutes
+
+#### 4. Function Execution Failures
+
+Alert on function invocation exceptions:
+
+```kusto
+exceptions
+| where timestamp > ago(5m)
+| where cloud_RoleName contains "SMTPPoller"
+```
+
+Or use the built-in metric:
+- **Signal:** `Failed requests`
+- **Threshold:** Greater than 0
+- **Frequency:** Every 5 minutes
+
+#### 5. Email Queue Backlog
+
+Alert when too many emails remain pending (requires custom telemetry or database query integration):
+
+```kusto
+traces
+| where message contains "Found" and message contains "pending emails"
+| parse message with * "Found " pendingCount:int " pending emails" *
+| where pendingCount > 500
+| where timestamp > ago(15m)
+```
+
+### Action Groups
+
+Action groups define who gets notified and how. Create one at **Azure Monitor** → **Alerts** → **Action groups** → **Create**.
+
+**Notification Types:**
+| Type | Use Case |
+|------|----------|
+| **Email** | Primary notifications to operations team |
+| **SMS** | Critical alerts requiring immediate attention |
+| **Azure mobile app** | Push notifications to on-call personnel |
+| **Voice call** | Urgent escalation for P1 incidents |
+| **Webhook** | Integration with external systems (PagerDuty, Slack, etc.) |
+| **Logic App** | Complex workflows (Teams messages, ticket creation, etc.) |
+| **Azure Function** | Custom automated remediation |
+
+### Example: Teams Notification via Logic App
+
+1. Create a Logic App with an HTTP trigger
+2. Add a "Post message to Teams" action
+3. Configure the webhook URL as an Action Group action
+
+### Alert Severity Guidelines
+
+| Severity | When to Use | Example |
+|----------|-------------|---------|
+| **Sev 0 - Critical** | Complete service outage | All functions failing |
+| **Sev 1 - Error** | Significant impact | SMTP relay unreachable |
+| **Sev 2 - Warning** | Potential issues | Throttling activated, high retry rate |
+| **Sev 3 - Informational** | Operational awareness | Unusual volume patterns |
+
+### Cost Considerations
+
+- **Log-based alerts:** Charged per evaluation (minimize frequency for non-critical alerts)
+- **Metric alerts:** Generally lower cost than log alerts
+- **Action group notifications:** SMS and voice calls incur per-notification costs
+
+**Tip:** Start with longer evaluation frequencies (15-30 min) for warning-level alerts and reserve 5-minute frequencies for critical alerts.
+
+### Quick Setup via Azure CLI
+
+```bash
+# Create an action group
+az monitor action-group create \
+  --resource-group <your-rg> \
+  --name "EmailPollerAlerts" \
+  --short-name "EmailAlert" \
+  --email-receiver name="OpsTeam" email="ops@example.com"
+
+# Create a log alert rule for failures
+az monitor scheduled-query create \
+  --resource-group <your-rg> \
+  --name "EmailSendFailures" \
+  --scopes "/subscriptions/<sub-id>/resourceGroups/<your-rg>/providers/microsoft.insights/components/<app-insights-name>" \
+  --condition "count 'traces | where message contains \"Failed to send email\"' > 0" \
+  --evaluation-frequency 5m \
+  --window-size 5m \
+  --severity 2 \
+  --action-groups "/subscriptions/<sub-id>/resourceGroups/<your-rg>/providers/microsoft.insights/actionGroups/EmailPollerAlerts"
+```
+
 ## Prerequisites
 
 ### 1. SQL Server Database Setup
@@ -214,7 +445,10 @@ SMTPPoller/
 │   │   ├── IEmailService.cs             # Email service interface
 │   │   ├── EmailService.cs              # SMTP email implementation
 │   │   ├── IEmailQueueRepository.cs     # Repository interface
-│   │   └── EmailQueueRepository.cs      # Stored procedure calls
+│   │   ├── EmailQueueRepository.cs      # Stored procedure calls
+│   │   ├── ISmtpThrottleService.cs      # Throttle service interface
+│   │   ├── SmtpThrottleService.cs       # Exponential backoff throttling
+│   │   └── SmtpThrottlingException.cs   # Throttle detection exception
 │   ├── Program.cs                       # Host and DI configuration
 │   ├── SMTPPoller.csproj               # Project dependencies
 │   ├── host.json                        # Azure Functions config
@@ -225,7 +459,9 @@ SMTPPoller/
 │   │   └── EmailQueueTimerTriggerTests.cs # Timer trigger unit tests
 │   ├── Services/
 │   │   ├── EmailServiceTests.cs         # Email service unit tests
-│   │   └── EmailQueueRepositoryTests.cs # Repository unit tests
+│   │   ├── EmailQueueRepositoryTests.cs # Repository unit tests
+│   │   ├── SmtpThrottleServiceTests.cs  # Throttle service unit tests
+│   │   └── SmtpThrottlingExceptionTests.cs # Throttle exception tests
 │   └── Helpers/
 │       └── EmailQueueRecordFactory.cs   # Test data factory
 ├── Database Scripts/
@@ -250,10 +486,12 @@ dotnet test --filter "FullyQualifiedName~EmailQueueTriggerTests"
 ```
 
 **Test Coverage:**
-- **EmailQueueTriggerTests** - SQL trigger function tests (insert/update/delete handling, error scenarios)
-- **EmailQueueTimerTriggerTests** - Timer trigger function tests (batch processing, configuration, error handling)
+- **EmailQueueTriggerTests** - SQL trigger function tests (insert/update/delete handling, error scenarios, throttling behavior)
+- **EmailQueueTimerTriggerTests** - Timer trigger function tests (batch processing, configuration, error handling, throttling behavior)
 - **EmailServiceTests** - SMTP service tests (email formatting, SSL, authentication)
 - **EmailQueueRepositoryTests** - Repository tests (stored procedure calls, connection handling)
+- **SmtpThrottleServiceTests** - Throttle service tests (backoff timing, recovery, state management)
+- **SmtpThrottlingExceptionTests** - Throttle detection tests (error pattern recognition)
 
 ## Local Development
 

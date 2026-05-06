@@ -16,6 +16,7 @@ public class EmailQueueTimerTriggerTests
     private readonly Mock<IConfiguration> _configurationMock;
     private readonly Mock<IEmailService> _emailServiceMock;
     private readonly Mock<IEmailQueueRepository> _repositoryMock;
+    private readonly Mock<ISmtpThrottleService> _throttleServiceMock;
     private readonly EmailQueueTimerTrigger _trigger;
 
     public EmailQueueTimerTriggerTests()
@@ -24,14 +25,18 @@ public class EmailQueueTimerTriggerTests
         _configurationMock = new Mock<IConfiguration>();
         _emailServiceMock = new Mock<IEmailService>();
         _repositoryMock = new Mock<IEmailQueueRepository>();
+        _throttleServiceMock = new Mock<ISmtpThrottleService>();
 
         _configurationMock.Setup(c => c["EmailQueueTimerMaxRecords"]).Returns("100");
+        _throttleServiceMock.Setup(t => t.IsThrottled()).Returns(false);
+        _throttleServiceMock.Setup(t => t.GetInterMessageDelay()).Returns(TimeSpan.Zero);
 
         _trigger = new EmailQueueTimerTrigger(
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
     }
 
     private static TimerInfo CreateTimerInfo(bool isPastDue = false)
@@ -180,7 +185,8 @@ public class EmailQueueTimerTriggerTests
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
 
         _repositoryMock.Setup(r => r.GetPendingEmailsAsync(50))
             .ReturnsAsync(new List<EmailQueueRecord>());
@@ -203,7 +209,8 @@ public class EmailQueueTimerTriggerTests
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
 
         _repositoryMock.Setup(r => r.GetPendingEmailsAsync(100))
             .ReturnsAsync(new List<EmailQueueRecord>());
@@ -226,7 +233,8 @@ public class EmailQueueTimerTriggerTests
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
 
         _repositoryMock.Setup(r => r.GetPendingEmailsAsync(100))
             .ReturnsAsync(new List<EmailQueueRecord>());
@@ -318,6 +326,96 @@ public class EmailQueueTimerTriggerTests
         // Assert - should continue to process second email (ClaimBatch already marked as Processing)
         _emailServiceMock.Verify(e => e.SendEmailAsync(successRecord), Times.Once);
         _repositoryMock.Verify(r => r.MarkAsSuccessAsync(successRecord.EmailQueueId), Times.Once);
+    }
+
+    [Fact]
+    public async Task Run_WhenThrottled_SkipsProcessing()
+    {
+        // Arrange
+        var timerInfo = CreateTimerInfo();
+        _throttleServiceMock.Setup(t => t.IsThrottled()).Returns(true);
+        _throttleServiceMock.Setup(t => t.GetThrottleTimeRemaining()).Returns(TimeSpan.FromSeconds(30));
+
+        // Act
+        await _trigger.Run(timerInfo);
+
+        // Assert - should not even try to get pending emails
+        _repositoryMock.Verify(r => r.GetPendingEmailsAsync(It.IsAny<int>()), Times.Never);
+        _emailServiceMock.Verify(e => e.SendEmailAsync(It.IsAny<EmailQueueRecord>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Run_OnSuccessfulSend_RecordsSuccess()
+    {
+        // Arrange
+        var timerInfo = CreateTimerInfo();
+        var record = EmailQueueRecordFactory.CreateValid();
+        var emails = new List<EmailQueueRecord> { record };
+
+        _repositoryMock.Setup(r => r.GetPendingEmailsAsync(It.IsAny<int>()))
+            .ReturnsAsync(emails);
+        _emailServiceMock.Setup(e => e.SendEmailAsync(record))
+            .Returns(Task.CompletedTask);
+        _repositoryMock.Setup(r => r.MarkAsSuccessAsync(record.EmailQueueId))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        await _trigger.Run(timerInfo);
+
+        // Assert
+        _throttleServiceMock.Verify(t => t.RecordSuccess(), Times.Once);
+    }
+
+    [Fact]
+    public async Task Run_OnSmtpThrottlingException_RecordsThrottling()
+    {
+        // Arrange
+        var timerInfo = CreateTimerInfo();
+        var record = EmailQueueRecordFactory.CreateValid();
+        var emails = new List<EmailQueueRecord> { record };
+
+        _repositoryMock.Setup(r => r.GetPendingEmailsAsync(It.IsAny<int>()))
+            .ReturnsAsync(emails);
+        _emailServiceMock.Setup(e => e.SendEmailAsync(record))
+            .ThrowsAsync(new SmtpThrottlingException("4.5.127 Excessive message rate"));
+        _repositoryMock.Setup(r => r.MarkAsFailureAsync(record.EmailQueueId, It.IsAny<string>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        await _trigger.Run(timerInfo);
+
+        // Assert
+        _throttleServiceMock.Verify(t => t.RecordThrottling(), Times.Once);
+    }
+
+    [Fact]
+    public async Task Run_WhenThrottlingMidBatch_StopsProcessing()
+    {
+        // Arrange
+        var timerInfo = CreateTimerInfo();
+        var record1 = EmailQueueRecordFactory.CreateValid(emailQueueId: 1);
+        var record2 = EmailQueueRecordFactory.CreateValid(emailQueueId: 2);
+        var emails = new List<EmailQueueRecord> { record1, record2 };
+
+        _repositoryMock.Setup(r => r.GetPendingEmailsAsync(It.IsAny<int>()))
+            .ReturnsAsync(emails);
+
+        // First call returns false (not throttled), subsequent calls return true (throttled)
+        var throttleCallCount = 0;
+        _throttleServiceMock.Setup(t => t.IsThrottled())
+            .Returns(() => throttleCallCount++ > 1);
+
+        _emailServiceMock.Setup(e => e.SendEmailAsync(record1))
+            .Returns(Task.CompletedTask);
+        _repositoryMock.Setup(r => r.MarkAsSuccessAsync(record1.EmailQueueId))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        await _trigger.Run(timerInfo);
+
+        // Assert - only first email should be processed
+        _emailServiceMock.Verify(e => e.SendEmailAsync(record1), Times.Once);
+        _emailServiceMock.Verify(e => e.SendEmailAsync(record2), Times.Never);
     }
 }
 

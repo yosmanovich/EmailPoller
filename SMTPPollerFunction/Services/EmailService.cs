@@ -23,6 +23,7 @@ public class EmailService : IEmailService
     /// <summary>
     /// Sends an email based on the EmailQueueRecord.
     /// </summary>
+    /// <exception cref="SmtpThrottlingException">Thrown when SMTP server returns a throttling response.</exception>
     public async Task SendEmailAsync(EmailQueueRecord emailRecord)
     {
         using var smtpClient = CreateSmtpClient();
@@ -33,11 +34,38 @@ public class EmailService : IEmailService
             emailRecord.Recipients,
             emailRecord.Subject);
 
-        await smtpClient.SendMailAsync(mailMessage);
+        try
+        {
+            await smtpClient.SendMailAsync(mailMessage);
 
-        _logger.LogInformation(
-            "Email sent successfully to {Recipients}",
-            emailRecord.Recipients);
+            _logger.LogInformation(
+                "Email sent successfully to {Recipients}",
+                emailRecord.Recipients);
+        }
+        catch (SmtpException ex) when (SmtpThrottlingException.IsThrottlingError(ex))
+        {
+            _logger.LogWarning(
+                "SMTP throttling detected for {Recipients}: {Message}",
+                emailRecord.Recipients,
+                ex.Message);
+
+            throw new SmtpThrottlingException(
+                $"SMTP server is throttling: {ex.Message}",
+                ex.StatusCode.ToString(),
+                null,
+                ex);
+        }
+        catch (Exception ex) when (SmtpThrottlingException.IsThrottlingError(ex))
+        {
+            _logger.LogWarning(
+                "SMTP throttling detected for {Recipients}: {Message}",
+                emailRecord.Recipients,
+                ex.Message);
+
+            throw new SmtpThrottlingException(
+                $"SMTP server is throttling: {ex.Message}",
+                ex);
+        }
     }
 
     private SmtpClient CreateSmtpClient()

@@ -16,6 +16,7 @@ public class EmailQueueTriggerTests
     private readonly Mock<IConfiguration> _configurationMock;
     private readonly Mock<IEmailService> _emailServiceMock;
     private readonly Mock<IEmailQueueRepository> _repositoryMock;
+    private readonly Mock<ISmtpThrottleService> _throttleServiceMock;
     private readonly EmailQueueTrigger _trigger;
 
     public EmailQueueTriggerTests()
@@ -24,14 +25,18 @@ public class EmailQueueTriggerTests
         _configurationMock = new Mock<IConfiguration>();
         _emailServiceMock = new Mock<IEmailService>();
         _repositoryMock = new Mock<IEmailQueueRepository>();
+        _throttleServiceMock = new Mock<ISmtpThrottleService>();
 
         _configurationMock.Setup(c => c["MonitoredTableName"]).Returns("dbo.EmailQueue");
+        _throttleServiceMock.Setup(t => t.IsThrottled()).Returns(false);
+        _throttleServiceMock.Setup(t => t.GetInterMessageDelay()).Returns(TimeSpan.Zero);
 
         _trigger = new EmailQueueTrigger(
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
     }
 
     private static SqlChange<EmailQueueRecord> CreateSqlChange(
@@ -309,7 +314,8 @@ public class EmailQueueTriggerTests
             _loggerMock.Object,
             _configurationMock.Object,
             _emailServiceMock.Object,
-            _repositoryMock.Object);
+            _repositoryMock.Object,
+            _throttleServiceMock.Object);
 
         // Assert
         Assert.NotNull(trigger);
@@ -399,5 +405,105 @@ public class EmailQueueTriggerTests
         _repositoryMock.Verify(r => r.MarkAsProcessingAsync(3), Times.Never);
         _emailServiceMock.Verify(e => e.SendEmailAsync(processingRecord), Times.Never);
         _emailServiceMock.Verify(e => e.SendEmailAsync(failedRecord), Times.Never);
+    }
+
+    [Fact]
+    public async Task Run_WhenThrottled_SkipsAllProcessing()
+    {
+        // Arrange
+        var record = EmailQueueRecordFactory.CreateValid();
+        var changes = new List<SqlChange<EmailQueueRecord>>
+        {
+            CreateSqlChange(record, SqlChangeOperation.Insert)
+        };
+
+        _throttleServiceMock.Setup(t => t.IsThrottled()).Returns(true);
+        _throttleServiceMock.Setup(t => t.GetThrottleTimeRemaining()).Returns(TimeSpan.FromSeconds(30));
+
+        // Act
+        await _trigger.Run(changes);
+
+        // Assert - nothing should be processed when throttled
+        _repositoryMock.Verify(r => r.MarkAsProcessingAsync(It.IsAny<int>()), Times.Never);
+        _emailServiceMock.Verify(e => e.SendEmailAsync(It.IsAny<EmailQueueRecord>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Run_OnSuccessfulSend_RecordsSuccess()
+    {
+        // Arrange
+        var record = EmailQueueRecordFactory.CreateValid();
+        var changes = new List<SqlChange<EmailQueueRecord>>
+        {
+            CreateSqlChange(record, SqlChangeOperation.Insert)
+        };
+
+        _repositoryMock.Setup(r => r.MarkAsProcessingAsync(record.EmailQueueId))
+            .Returns(Task.CompletedTask);
+        _emailServiceMock.Setup(e => e.SendEmailAsync(record))
+            .Returns(Task.CompletedTask);
+        _repositoryMock.Setup(r => r.MarkAsSuccessAsync(record.EmailQueueId))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        await _trigger.Run(changes);
+
+        // Assert
+        _throttleServiceMock.Verify(t => t.RecordSuccess(), Times.Once);
+    }
+
+    [Fact]
+    public async Task Run_OnSmtpThrottlingException_RecordsThrottling()
+    {
+        // Arrange
+        var record = EmailQueueRecordFactory.CreateValid();
+        var changes = new List<SqlChange<EmailQueueRecord>>
+        {
+            CreateSqlChange(record, SqlChangeOperation.Insert)
+        };
+
+        _repositoryMock.Setup(r => r.MarkAsProcessingAsync(record.EmailQueueId))
+            .Returns(Task.CompletedTask);
+        _emailServiceMock.Setup(e => e.SendEmailAsync(record))
+            .ThrowsAsync(new SmtpThrottlingException("4.5.127 Excessive message rate"));
+        _repositoryMock.Setup(r => r.MarkAsFailureAsync(record.EmailQueueId, It.IsAny<string>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        await _trigger.Run(changes);
+
+        // Assert
+        _throttleServiceMock.Verify(t => t.RecordThrottling(), Times.Once);
+        _repositoryMock.Verify(r => r.MarkAsFailureAsync(record.EmailQueueId, It.IsAny<string>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Run_WithInterMessageDelay_WaitsBeforeSecondMessage()
+    {
+        // Arrange
+        var record1 = EmailQueueRecordFactory.CreateValid(emailQueueId: 1);
+        var record2 = EmailQueueRecordFactory.CreateValid(emailQueueId: 2);
+        var changes = new List<SqlChange<EmailQueueRecord>>
+        {
+            CreateSqlChange(record1, SqlChangeOperation.Insert),
+            CreateSqlChange(record2, SqlChangeOperation.Insert)
+        };
+
+        _throttleServiceMock.Setup(t => t.GetInterMessageDelay()).Returns(TimeSpan.FromMilliseconds(100));
+        _repositoryMock.Setup(r => r.MarkAsProcessingAsync(It.IsAny<int>()))
+            .Returns(Task.CompletedTask);
+        _emailServiceMock.Setup(e => e.SendEmailAsync(It.IsAny<EmailQueueRecord>()))
+            .Returns(Task.CompletedTask);
+        _repositoryMock.Setup(r => r.MarkAsSuccessAsync(It.IsAny<int>()))
+            .Returns(Task.CompletedTask);
+
+        // Act
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await _trigger.Run(changes);
+        sw.Stop();
+
+        // Assert - should have waited at least 100ms between messages
+        Assert.True(sw.ElapsedMilliseconds >= 90); // Allow some timing variance
+        _emailServiceMock.Verify(e => e.SendEmailAsync(It.IsAny<EmailQueueRecord>()), Times.Exactly(2));
     }
 }

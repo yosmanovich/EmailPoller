@@ -25,6 +25,7 @@ var host = new HostBuilder()
         });
 
         // Register services
+        services.AddSingleton<ISmtpThrottleService, SmtpThrottleService>();
         services.AddSingleton<IEmailService, EmailService>();
         services.AddSingleton<IEmailQueueRepository, EmailQueueRepository>();
     })

@@ -17,17 +17,20 @@ public class EmailQueueTrigger
     private readonly IConfiguration _configuration;
     private readonly IEmailService _emailService;
     private readonly IEmailQueueRepository _emailQueueRepository;
+    private readonly ISmtpThrottleService _throttleService;
 
     public EmailQueueTrigger(
         ILogger<EmailQueueTrigger> logger,
         IConfiguration configuration,
         IEmailService emailService,
-        IEmailQueueRepository emailQueueRepository)
+        IEmailQueueRepository emailQueueRepository,
+        ISmtpThrottleService throttleService)
     {
         _logger = logger;
         _configuration = configuration;
         _emailService = emailService;
         _emailQueueRepository = emailQueueRepository;
+        _throttleService = throttleService;
     }
 
     /// <summary>
@@ -60,12 +63,41 @@ public class EmailQueueTrigger
         var tableName = _configuration["MonitoredTableName"];
         _logger.LogInformation("Processing {Count} change(s) from table: {TableName}", changes.Count, tableName);
 
+        // Check if we're currently throttled
+        if (_throttleService.IsThrottled())
+        {
+            var remaining = _throttleService.GetThrottleTimeRemaining();
+            _logger.LogWarning(
+                "SMTP throttling active. Skipping {Count} messages. Throttle expires in {Seconds:F0} seconds",
+                changes.Count,
+                remaining.TotalSeconds);
+            return; // Let the timer trigger pick these up later
+        }
+
+        var interMessageDelay = _throttleService.GetInterMessageDelay();
+        var isFirstMessage = true;
+
         foreach (var change in changes)
         {
             // Only process INSERT operations for new queue items
             if (change.Operation == SqlChangeOperation.Insert)
-            {               
+            {
+                // Add delay between messages if we've had recent throttling
+                if (!isFirstMessage && interMessageDelay > TimeSpan.Zero)
+                {
+                    _logger.LogDebug("Throttle recovery: waiting {Delay}ms between messages", interMessageDelay.TotalMilliseconds);
+                    await Task.Delay(interMessageDelay);
+                }
+
                 await ProcessEmailQueueItemAsync(change.Item);
+                isFirstMessage = false;
+
+                // Re-check throttle status after each send
+                if (_throttleService.IsThrottled())
+                {
+                    _logger.LogWarning("Throttling activated during batch. Stopping further processing.");
+                    break;
+                }
             }
             else
             {
@@ -110,10 +142,39 @@ public class EmailQueueTrigger
             // Step 3: Mark as Success (removes from queue)
             await _emailQueueRepository.MarkAsSuccessAsync(record.EmailQueueId);
 
+            // Record successful send for throttle recovery
+            _throttleService.RecordSuccess();
+
             _logger.LogInformation(
                 "Successfully sent email EmailQueueId={EmailQueueId} to {Recipients}",
                 record.EmailQueueId,
                 record.Recipients);
+        }
+        catch (SmtpThrottlingException ex)
+        {
+            // Record throttling and activate backoff
+            _throttleService.RecordThrottling();
+
+            _logger.LogWarning(
+                ex,
+                "SMTP throttling for EmailQueueId={EmailQueueId}. Will retry later.",
+                record.EmailQueueId);
+
+            try
+            {
+                // Mark as failed with throttling message - will be retried
+                await _emailQueueRepository.MarkAsFailureAsync(
+                    record.EmailQueueId,
+                    $"SMTP throttling: {ex.Message}");
+            }
+            catch (Exception failureEx)
+            {
+                _logger.LogError(
+                    failureEx,
+                    "Failed to mark EmailQueueId={EmailQueueId} as failed: {ErrorMessage}",
+                    record.EmailQueueId,
+                    failureEx.Message);
+            }
         }
         catch (Exception ex)
         {
